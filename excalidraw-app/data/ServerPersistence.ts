@@ -13,6 +13,7 @@ import { appJotaiStore, atom } from "../app-jotai";
 import { SAVE_TO_LOCAL_STORAGE_TIMEOUT } from "../app_constants";
 
 import { LocalData } from "./LocalData";
+import { setLastActiveSceneId } from "./tabSync";
 
 const BACKEND_URL = import.meta.env.VITE_APP_BACKEND_URL;
 
@@ -78,6 +79,13 @@ const buildFileMeta = (
 
 export class ServerPersistence {
   private static _currentSceneId: string | null = null;
+  private static _lastSaveArgs: {
+    elements: readonly ExcalidrawElement[];
+    appState: Partial<AppState>;
+    files: BinaryFiles;
+    onSaved: () => void;
+  } | null = null;
+  private static _pendingFileSaves = new Set<Promise<void>>();
 
   static getBrowserId(): string {
     const BROWSER_ID_KEY = "excalidraw-browser-id";
@@ -96,7 +104,7 @@ export class ServerPersistence {
   static setCurrentSceneId(sceneId: string | null) {
     this._currentSceneId = sceneId;
     if (sceneId) {
-      localStorage.setItem("excalidraw-last-scene", sceneId);
+      setLastActiveSceneId(sceneId);
     }
   }
 
@@ -104,27 +112,29 @@ export class ServerPersistence {
     return localStorage.getItem("excalidraw-last-scene");
   }
 
-  private static _save = debounce(
-    async (
-      elements: readonly ExcalidrawElement[],
-      appState: Partial<AppState>,
-      files: BinaryFiles,
-      onSaved: () => void,
-    ) => {
-      const sceneId = this._currentSceneId;
-      if (!sceneId) {
-        return;
-      }
+  private static _performSave = async (
+    elements: readonly ExcalidrawElement[],
+    appState: Partial<AppState>,
+    files: BinaryFiles,
+    onSaved: () => void,
+    keepalive: boolean,
+  ) => {
+    const sceneId = this._currentSceneId;
+    if (!sceneId) {
+      return;
+    }
 
-      const browserId = this.getBrowserId();
-      const name = appState.name || "Untitled";
+    const browserId = this.getBrowserId();
+    const name = appState.name || "Untitled";
 
-      const serialized = serializeAsJSON(elements, appState, files, "database");
-      const data = JSON.parse(serialized);
-      const filesMeta = buildFileMeta(elements, files);
+    const serialized = serializeAsJSON(elements, appState, files, "database");
+    const data = JSON.parse(serialized);
+    const filesMeta = buildFileMeta(elements, files);
 
-      try {
-        const response = await fetch(`${BACKEND_URL}/api/scenes/${sceneId}`, {
+    try {
+      const response = await fetch(
+        `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}`,
+        {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -134,23 +144,35 @@ export class ServerPersistence {
             appState: data.appState,
             files: filesMeta,
           }),
-          keepalive: true,
-        });
+          keepalive,
+        },
+      );
 
-        if (!response.ok) {
-          throw new Error(`Failed to save scene: ${response.status}`);
-        }
-
-        appJotaiStore.set(serverSaveErrorAtom, null);
-      } catch (error: any) {
-        console.error("Server save error:", error);
-        appJotaiStore.set(
-          serverSaveErrorAtom,
-          error.message || "Failed to save scene",
-        );
+      if (!response.ok) {
+        throw new Error(`Failed to save scene: ${response.status}`);
       }
 
-      onSaved();
+      appJotaiStore.set(serverSaveErrorAtom, null);
+    } catch (error: any) {
+      console.error("Server save error:", error);
+      appJotaiStore.set(
+        serverSaveErrorAtom,
+        error.message || "Failed to save scene",
+      );
+    }
+
+    onSaved();
+  };
+
+  private static _save = debounce(
+    async (
+      elements: readonly ExcalidrawElement[],
+      appState: Partial<AppState>,
+      files: BinaryFiles,
+      onSaved: () => void,
+    ) => {
+      this._lastSaveArgs = { elements, appState, files, onSaved };
+      await this._performSave(elements, appState, files, onSaved, false);
     },
     SAVE_TO_LOCAL_STORAGE_TIMEOUT,
   );
@@ -167,7 +189,15 @@ export class ServerPersistence {
   };
 
   static flushSave = () => {
-    this._save.flush();
+    this._save.cancel();
+    if (this._lastSaveArgs) {
+      const { elements, appState, files, onSaved } = this._lastSaveArgs;
+      this._performSave(elements, appState, files, onSaved, true);
+    }
+  };
+
+  static flushFileSaves = async () => {
+    await Promise.all(this._pendingFileSaves);
   };
 
   static async createScene(
@@ -204,7 +234,7 @@ export class ServerPersistence {
   static async loadScene(sceneId: string): Promise<ServerScene | null> {
     const browserId = this.getBrowserId();
     const response = await fetch(
-      `${BACKEND_URL}/api/scenes/${sceneId}?browserId=${browserId}`,
+      `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}?browserId=${encodeURIComponent(browserId)}`,
     );
 
     if (response.status === 404) {
@@ -251,11 +281,14 @@ export class ServerPersistence {
 
   static async deleteScene(sceneId: string): Promise<void> {
     const browserId = this.getBrowserId();
-    const response = await fetch(`${BACKEND_URL}/api/scenes/${sceneId}`, {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ browserId }),
-    });
+    const response = await fetch(
+      `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}`,
+      {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ browserId }),
+      },
+    );
     if (!response.ok) {
       throw new Error(`Failed to delete scene: ${response.status}`);
     }
@@ -279,36 +312,34 @@ export class ServerPersistence {
       const loadedFiles: BinaryFileData[] = [];
       const erroredFiles = new Map<FileId, true>();
 
-      await Promise.all(
-        ids.map(async (id) => {
-          try {
-            const response = await fetch(
-              `${BACKEND_URL}/api/scenes/${sceneId}/files/${id}`,
-            );
-            if (!response.ok) {
-              erroredFiles.set(id, true);
-              return;
-            }
-
-            const blob = await response.blob();
-            const mimeType =
-              response.headers.get("Content-Type") ||
-              "application/octet-stream";
-            const dataURL = await blobToDataURL(blob);
-
-            loadedFiles.push({
-              id,
-              mimeType: mimeType as BinaryFileData["mimeType"],
-              dataURL: dataURL as BinaryFileData["dataURL"],
-              created: Date.now(),
-              lastRetrieved: Date.now(),
-            });
-          } catch (error) {
-            console.error(`Failed to load file ${id}:`, error);
+      await withConcurrencyLimit(ids, 5, async (id) => {
+        try {
+          const response = await fetch(
+            `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}/files/${encodeURIComponent(id)}`,
+          );
+          if (!response.ok) {
             erroredFiles.set(id, true);
+            return;
           }
-        }),
-      );
+
+          const blob = await response.blob();
+          const mimeType =
+            response.headers.get("Content-Type") ||
+            "application/octet-stream";
+          const dataURL = await blobToDataURL(blob);
+
+          loadedFiles.push({
+            id,
+            mimeType: mimeType as BinaryFileData["mimeType"],
+            dataURL: dataURL as BinaryFileData["dataURL"],
+            created: Date.now(),
+            lastRetrieved: Date.now(),
+          });
+        } catch (error) {
+          console.error(`Failed to load file ${id}:`, error);
+          erroredFiles.set(id, true);
+        }
+      });
 
       return { loadedFiles, erroredFiles };
     },
@@ -332,8 +363,8 @@ export class ServerPersistence {
       const savedFiles = new Map<FileId, BinaryFileData>();
       const erroredFiles = new Map<FileId, BinaryFileData>();
 
-      await Promise.all(
-        [...addedFiles].map(async ([id, fileData]) => {
+      await withConcurrencyLimit([...addedFiles], 5, async ([id, fileData]) => {
+        const savePromise = (async () => {
           try {
             const blob = await fetch(fileData.dataURL).then((r) => r.blob());
 
@@ -344,7 +375,7 @@ export class ServerPersistence {
             formData.append("created", String(fileData.created));
 
             const response = await fetch(
-              `${BACKEND_URL}/api/scenes/${sceneId}/files`,
+              `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}/files`,
               {
                 method: "POST",
                 body: formData,
@@ -361,10 +392,31 @@ export class ServerPersistence {
             console.error(`Failed to save file ${id}:`, error);
             erroredFiles.set(id, fileData);
           }
-        }),
-      );
+        })();
+
+        ServerPersistence._pendingFileSaves.add(savePromise);
+        await savePromise;
+        ServerPersistence._pendingFileSaves.delete(savePromise);
+      });
 
       return { savedFiles, erroredFiles };
     },
   };
 }
+
+const withConcurrencyLimit = async <T,>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+) => {
+  const queue = [...items];
+  const executeNext = async () => {
+    const item = queue.shift();
+    if (!item) {
+      return;
+    }
+    await fn(item);
+    await executeNext();
+  };
+  await Promise.all(Array.from({ length: limit }, () => executeNext()));
+};

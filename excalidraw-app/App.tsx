@@ -260,6 +260,7 @@ const initializeScene = async (opts: {
   // Server persistence branch
   if (isServerPersistenceEnabled && !isExternalScene && !externalUrlMatch) {
     const sceneId = sceneIdParam || ServerPersistence.getLastActiveSceneId();
+    let shouldCreateNewScene = !sceneId;
 
     if (sceneId) {
       try {
@@ -279,31 +280,36 @@ const initializeScene = async (opts: {
           };
           return { scene, isExternalScene: false };
         }
+        // 404: scene not found, fall through to create new
       } catch (error) {
         console.error("Failed to load scene from server:", error);
+        // Network or other error: do not create a new empty scene,
+        // fall back to localStorage behavior below
+        shouldCreateNewScene = false;
       }
     }
 
-    // Create new empty scene
-    try {
-      const defaultAppState = getDefaultAppState();
-      const newScene = await ServerPersistence.createScene(
-        [],
-        defaultAppState,
-        {},
-      );
-      ServerPersistence.setCurrentSceneId(newScene.id);
-      const url = new URL(window.location.href);
-      url.searchParams.set("scene", newScene.id);
-      window.history.replaceState({}, APP_NAME, url.toString());
-      scene = {
-        elements: [],
-        appState: restoreAppState({}, localDataState?.appState),
-      };
-      return { scene, isExternalScene: false };
-    } catch (error) {
-      console.error("Failed to create new scene on server:", error);
-      // Fall back to localStorage behavior below
+    if (shouldCreateNewScene) {
+      try {
+        const defaultAppState = getDefaultAppState();
+        const newScene = await ServerPersistence.createScene(
+          [],
+          defaultAppState,
+          {},
+        );
+        ServerPersistence.setCurrentSceneId(newScene.id);
+        const url = new URL(window.location.href);
+        url.searchParams.set("scene", newScene.id);
+        window.history.replaceState({}, APP_NAME, url.toString());
+        scene = {
+          elements: [],
+          appState: restoreAppState({}, localDataState?.appState),
+        };
+        return { scene, isExternalScene: false };
+      } catch (error) {
+        console.error("Failed to create new scene on server:", error);
+        // Fall back to localStorage behavior below
+      }
     }
   }
 
@@ -714,6 +720,7 @@ const ExcalidrawWrapper = () => {
     const onUnload = () => {
       if (isServerPersistenceEnabled) {
         ServerPersistence.flushSave();
+        ServerPersistence.flushFileSaves().catch(() => {});
       } else {
         LocalData.flushSave();
       }
@@ -723,6 +730,7 @@ const ExcalidrawWrapper = () => {
       if (event.type === EVENT.BLUR || document.hidden) {
         if (isServerPersistenceEnabled) {
           ServerPersistence.flushSave();
+          ServerPersistence.flushFileSaves().catch(() => {});
         } else {
           LocalData.flushSave();
         }
