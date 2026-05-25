@@ -7,11 +7,15 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 
 const DATA_DIR = path.join(__dirname, "data");
 const FILES_DIR = path.join(DATA_DIR, "files");
 const DB_PATH = path.join(DATA_DIR, "excalidraw.db");
+
+const MAX_JSON_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+const MAX_MULTIPART_BODY_SIZE = 50 * 1024 * 1024; // 50 MB
 
 // Ensure directories exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -56,12 +60,15 @@ db.exec(`
 `);
 
 // Utility functions
-const generateUUID = () => {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+const generateUUID = () => crypto.randomUUID();
+
+const assertSafePath = (baseDir, ...segments) => {
+  const resolvedBase = path.resolve(baseDir);
+  const resolved = path.resolve(baseDir, ...segments);
+  if (!resolved.startsWith(resolvedBase + path.sep) && resolved !== resolvedBase) {
+    throw new Error("Invalid path");
+  }
+  return resolved;
 };
 
 const parseJSON = (str, fallback) => {
@@ -72,15 +79,23 @@ const parseJSON = (str, fallback) => {
   }
 };
 
-const readBody = (req) =>
+const readBody = (req, maxSize = MAX_JSON_BODY_SIZE) =>
   new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => resolve(body));
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxSize) {
+        reject(new Error("Request body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
 
-const parseMultipart = (req) =>
+const parseMultipart = (req, maxSize = MAX_MULTIPART_BODY_SIZE) =>
   new Promise((resolve, reject) => {
     const contentType = req.headers["content-type"] || "";
     const boundaryMatch = contentType.match(/boundary=([^;\s]+)/);
@@ -91,8 +106,14 @@ const parseMultipart = (req) =>
     const boundary = "--" + boundaryMatch[1];
     const parts = [];
     let buffer = Buffer.alloc(0);
+    let size = 0;
 
     req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxSize) {
+        reject(new Error("Request body too large"));
+        return;
+      }
       buffer = Buffer.concat([buffer, chunk]);
     });
 
@@ -277,45 +298,53 @@ const deleteScene = async (req, res, sceneId) => {
     return sendError(res, 400, "browserId is required");
   }
 
-  // Delete associated files first
-  const filesStmt = db.prepare("SELECT id FROM files WHERE scene_id = ?");
-  const files = filesStmt.all(sceneId);
-  for (const file of files) {
-    const filePath = path.join(FILES_DIR, sceneId, file.id);
-    try {
-      fs.unlinkSync(filePath);
-    } catch (e) {
-      // ignore if file doesn't exist
-    }
-  }
-
-  // Remove scene directory
-  const sceneDir = path.join(FILES_DIR, sceneId);
-  try {
-    fs.rmdirSync(sceneDir);
-  } catch (e) {
-    // ignore if directory doesn't exist or isn't empty
-  }
-
-  db.prepare("DELETE FROM files WHERE scene_id = ?").run(sceneId);
-  const result = db.prepare("DELETE FROM scenes WHERE id = ? AND browser_id = ?").run(sceneId, data.browserId);
-
-  if (result.changes === 0) {
+  // Verify ownership before doing anything destructive
+  const checkStmt = db.prepare("SELECT 1 FROM scenes WHERE id = ? AND browser_id = ?");
+  if (!checkStmt.get(sceneId, data.browserId)) {
     return sendError(res, 404, "Scene not found");
+  }
+
+  db.exec("BEGIN");
+  try {
+    // Delete associated files from disk first (best-effort, not transactional)
+    const filesStmt = db.prepare("SELECT id FROM files WHERE scene_id = ?");
+    const files = filesStmt.all(sceneId);
+    for (const file of files) {
+      try {
+        const filePath = assertSafePath(FILES_DIR, sceneId, file.id);
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        // ignore if file doesn't exist or path is invalid
+      }
+    }
+
+    // Remove scene directory (best-effort)
+    try {
+      const sceneDir = assertSafePath(FILES_DIR, sceneId);
+      fs.rmdirSync(sceneDir);
+    } catch (e) {
+      // ignore if directory doesn't exist or isn't empty
+    }
+
+    db.prepare("DELETE FROM files WHERE scene_id = ?").run(sceneId);
+    db.prepare("DELETE FROM scenes WHERE id = ? AND browser_id = ?").run(sceneId, data.browserId);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
   }
 
   sendJSON(res, 200, { deleted: true });
 };
 
 const uploadFile = async (req, res, sceneId) => {
-  // Verify scene exists (any browser can upload files to a scene... actually no, we should check)
-  // For simplicity, we'll skip browserId check on upload since the client sends it in the form data
   const parts = await parseMultipart(req);
 
   let fileData = null;
   let fileId = null;
   let mimeType = null;
   let created = null;
+  let browserId = null;
 
   for (const part of parts) {
     if (part.name === "file") {
@@ -326,19 +355,30 @@ const uploadFile = async (req, res, sceneId) => {
       mimeType = part.value;
     } else if (part.name === "created") {
       created = parseInt(part.value, 10);
+    } else if (part.name === "browserId") {
+      browserId = part.value;
     }
   }
 
+  if (!browserId) {
+    return sendError(res, 400, "browserId is required");
+  }
   if (!fileData || !fileId || !mimeType) {
     return sendError(res, 400, "Missing required file fields");
   }
 
-  const sceneDir = path.join(FILES_DIR, sceneId);
+  // Verify the scene exists and belongs to the browser
+  const checkStmt = db.prepare("SELECT 1 FROM scenes WHERE id = ? AND browser_id = ?");
+  if (!checkStmt.get(sceneId, browserId)) {
+    return sendError(res, 404, "Scene not found");
+  }
+
+  const sceneDir = assertSafePath(FILES_DIR, sceneId);
   if (!fs.existsSync(sceneDir)) {
     fs.mkdirSync(sceneDir, { recursive: true });
   }
 
-  const filePath = path.join(sceneDir, fileId);
+  const filePath = assertSafePath(FILES_DIR, sceneId, fileId);
   fs.writeFileSync(filePath, fileData);
 
   const now = created || Date.now();
@@ -352,8 +392,19 @@ const uploadFile = async (req, res, sceneId) => {
   sendJSON(res, 201, { fileId, mimeType, created: now, size });
 };
 
-const getFile = (req, res, sceneId, fileId) => {
-  const filePath = path.join(FILES_DIR, sceneId, fileId);
+const getFile = (req, res, query, sceneId, fileId) => {
+  const browserId = query.get("browserId");
+  if (!browserId) {
+    return sendError(res, 400, "browserId is required");
+  }
+
+  // Verify the scene belongs to the browserId
+  const checkStmt = db.prepare("SELECT 1 FROM scenes WHERE id = ? AND browser_id = ?");
+  if (!checkStmt.get(sceneId, browserId)) {
+    return sendError(res, 404, "Scene not found");
+  }
+
+  const filePath = assertSafePath(FILES_DIR, sceneId, fileId);
   if (!fs.existsSync(filePath)) {
     return sendError(res, 404, "File not found");
   }
@@ -384,11 +435,11 @@ const deleteFile = async (req, res, sceneId, fileId) => {
     return sendError(res, 404, "Scene not found");
   }
 
-  const filePath = path.join(FILES_DIR, sceneId, fileId);
   try {
+    const filePath = assertSafePath(FILES_DIR, sceneId, fileId);
     fs.unlinkSync(filePath);
   } catch (e) {
-    // ignore
+    // ignore if file doesn't exist or path is invalid
   }
 
   db.prepare("DELETE FROM files WHERE id = ? AND scene_id = ?").run(fileId, sceneId);
@@ -420,7 +471,7 @@ const server = http.createServer(async (req, res) => {
     } else if (pathname.startsWith("/api/scenes/") && pathname.includes("/files/") && req.method === "GET") {
       const rest = pathname.slice("/api/scenes/".length);
       const [sceneId, , fileId] = rest.split("/");
-      getFile(req, res, sceneId, fileId);
+      getFile(req, res, query, sceneId, fileId);
     } else if (pathname.startsWith("/api/scenes/") && pathname.includes("/files/") && req.method === "DELETE") {
       const rest = pathname.slice("/api/scenes/".length);
       const [sceneId, , fileId] = rest.split("/");
@@ -441,7 +492,11 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (error) {
     console.error("Server error:", error);
-    sendError(res, 500, error.message || "Internal server error");
+    const clientMessage = error.message === "Request body too large"
+      ? "Request body too large"
+      : "Internal server error";
+    const status = error.message === "Request body too large" ? 413 : 500;
+    sendError(res, status, clientMessage);
   }
 });
 
