@@ -39,6 +39,7 @@ export type ServerScene = {
 };
 
 export const serverSaveErrorAtom = atom<string | null>(null);
+export const serverSavingAtom = atom<boolean>(false);
 
 const blobToDataURL = (blob: Blob): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -131,6 +132,7 @@ export class ServerPersistence {
     const data = JSON.parse(serialized);
     const filesMeta = buildFileMeta(elements, files);
 
+    appJotaiStore.set(serverSavingAtom, true);
     try {
       const response = await fetch(
         `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}`,
@@ -159,6 +161,8 @@ export class ServerPersistence {
         serverSaveErrorAtom,
         error.message || "Failed to save scene",
       );
+    } finally {
+      appJotaiStore.set(serverSavingAtom, false);
     }
 
     onSaved();

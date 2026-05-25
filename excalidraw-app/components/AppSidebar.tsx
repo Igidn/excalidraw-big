@@ -1,19 +1,35 @@
 import { DefaultSidebar, Sidebar, THEME } from "@excalidraw/excalidraw";
 import {
+  LoadIcon,
   messageCircleIcon,
   presentationIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { LinkButton } from "@excalidraw/excalidraw/components/LinkButton";
 import { useUIAppState } from "@excalidraw/excalidraw/context/ui-appState";
 
+import { isServerPersistenceEnabled } from "../data/ServerPersistence";
+
+import { SceneList } from "./SceneList";
 import "./AppSidebar.scss";
 
-export const AppSidebar = () => {
+export const AppSidebar: React.FC<{
+  currentSceneId: string | null;
+  onSceneSelect: (sceneId: string) => void;
+  onNewBoard: () => void;
+}> = ({ currentSceneId, onSceneSelect, onNewBoard }) => {
   const { theme, openSidebar } = useUIAppState();
 
   return (
     <DefaultSidebar>
       <DefaultSidebar.TabTriggers>
+        {isServerPersistenceEnabled && (
+          <Sidebar.TabTrigger
+            tab="scenes"
+            style={{ opacity: openSidebar?.tab === "scenes" ? 1 : 0.4 }}
+          >
+            {LoadIcon}
+          </Sidebar.TabTrigger>
+        )}
         <Sidebar.TabTrigger
           tab="comments"
           style={{ opacity: openSidebar?.tab === "comments" ? 1 : 0.4 }}
@@ -27,6 +43,15 @@ export const AppSidebar = () => {
           {presentationIcon}
         </Sidebar.TabTrigger>
       </DefaultSidebar.TabTriggers>
+      {isServerPersistenceEnabled && (
+        <Sidebar.Tab tab="scenes">
+          <SceneList
+            currentSceneId={currentSceneId}
+            onSceneSelect={onSceneSelect}
+            onNewBoard={onNewBoard}
+          />
+        </Sidebar.Tab>
+      )}
       <Sidebar.Tab tab="comments">
         <div className="app-sidebar-promo-container">
           <div

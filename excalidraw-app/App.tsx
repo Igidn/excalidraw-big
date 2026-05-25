@@ -47,6 +47,7 @@ import {
   exportToPlus,
   share,
   youtubeIcon,
+  PlusIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { isElementLink } from "@excalidraw/element";
 import {
@@ -281,11 +282,18 @@ const initializeScene = async (opts: {
           return { scene, isExternalScene: false };
         }
         // 404: scene not found, fall through to create new
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to load scene from server:", error);
-        // Network or other error: do not create a new empty scene,
-        // fall back to localStorage behavior below
-        shouldCreateNewScene = false;
+        return {
+          scene: {
+            appState: {
+              errorMessage:
+                error.message ||
+                "Unable to connect to the whiteboard server. Please check your connection.",
+            },
+          },
+          isExternalScene: false,
+        };
       }
     }
 
@@ -306,9 +314,18 @@ const initializeScene = async (opts: {
           appState: restoreAppState({}, localDataState?.appState),
         };
         return { scene, isExternalScene: false };
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to create new scene on server:", error);
-        // Fall back to localStorage behavior below
+        return {
+          scene: {
+            appState: {
+              errorMessage:
+                error.message ||
+                "Unable to connect to the whiteboard server. Please check your connection.",
+            },
+          },
+          isExternalScene: false,
+        };
       }
     }
   }
@@ -920,6 +937,113 @@ const ExcalidrawWrapper = () => {
 
   const localStorageQuotaExceeded = useAtomValue(localStorageQuotaExceededAtom);
 
+  const [serverLoadError, setServerLoadError] = useState<string | null>(null);
+
+  const handleSceneSelect = useCallback(
+    async (sceneId: string) => {
+      if (!excalidrawAPI || !isServerPersistenceEnabled) {
+        return;
+      }
+      if (sceneId === ServerPersistence.getCurrentSceneId()) {
+        return;
+      }
+
+      ServerPersistence.flushSave();
+      await ServerPersistence.flushFileSaves().catch(() => {});
+
+      excalidrawAPI.updateScene({ appState: { isLoading: true } });
+
+      try {
+        const serverScene = await ServerPersistence.loadScene(sceneId);
+        if (!serverScene) {
+          throw new Error("Board not found");
+        }
+
+        ServerPersistence.setCurrentSceneId(serverScene.id);
+
+        const url = new URL(window.location.href);
+        url.searchParams.set("scene", serverScene.id);
+        window.history.replaceState({}, APP_NAME, url.toString());
+
+        excalidrawAPI.updateScene({
+          elements: restoreElements(serverScene.elements, null, {
+            repairBindings: true,
+            deleteInvisibleElements: true,
+          }),
+          appState: restoreAppState(
+            serverScene.appState,
+            excalidrawAPI.getAppState(),
+          ),
+          captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+        });
+
+        const fileIds =
+          serverScene.elements?.reduce((acc: FileId[], element) => {
+            if (isInitializedImageElement(element)) {
+              return acc.concat(element.fileId);
+            }
+            return acc;
+          }, [] as FileId[]) || [];
+
+        if (fileIds.length) {
+          fileManagerRef.current
+            .getFiles(fileIds)
+            .then(({ loadedFiles, erroredFiles }) => {
+              if (loadedFiles.length) {
+                excalidrawAPI.addFiles(loadedFiles);
+              }
+              updateStaleImageStatuses({
+                excalidrawAPI,
+                erroredFiles,
+                elements: excalidrawAPI.getSceneElementsIncludingDeleted(),
+              });
+            });
+        }
+      } catch (error: any) {
+        console.error("Failed to switch scene:", error);
+        setServerLoadError(
+          error.message || "Unable to connect to the whiteboard server. Please check your connection.",
+        );
+        excalidrawAPI.updateScene({ appState: { isLoading: false } });
+      }
+    },
+    [excalidrawAPI],
+  );
+
+  const handleNewBoard = useCallback(async () => {
+    if (!excalidrawAPI || !isServerPersistenceEnabled) {
+      return;
+    }
+
+    ServerPersistence.flushSave();
+    await ServerPersistence.flushFileSaves().catch(() => {});
+
+    const defaultAppState = getDefaultAppState();
+    try {
+      const newScene = await ServerPersistence.createScene(
+        [],
+        defaultAppState,
+        {},
+      );
+      ServerPersistence.setCurrentSceneId(newScene.id);
+
+      const url = new URL(window.location.href);
+      url.searchParams.set("scene", newScene.id);
+      window.history.replaceState({}, APP_NAME, url.toString());
+
+      excalidrawAPI.updateScene({
+        elements: [],
+        appState: restoreAppState({}, excalidrawAPI.getAppState()),
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+    } catch (error: any) {
+      console.error("Failed to create new scene:", error);
+      setServerLoadError(
+        error.message || "Unable to connect to the whiteboard server. Please check your connection.",
+      );
+    }
+  }, [excalidrawAPI]);
+
   const onCollabDialogOpen = useCallback(
     () => setShareDialogState({ isOpen: true, type: "collaborationOnly" }),
     [setShareDialogState],
@@ -1122,6 +1246,7 @@ const ExcalidrawWrapper = () => {
           theme={appTheme}
           setTheme={(theme) => setAppTheme(theme)}
           refresh={() => forceRefresh((prev) => !prev)}
+          onNewBoard={handleNewBoard}
         />
         <AppWelcomeScreen
           onCollabDialogOpen={onCollabDialogOpen}
@@ -1161,6 +1286,26 @@ const ExcalidrawWrapper = () => {
             {t("alerts.localStorageQuotaExceeded")}
           </div>
         )}
+        {serverLoadError && (
+          <div className="alert alert--danger">
+            {serverLoadError}
+            <button
+              onClick={() => setServerLoadError(null)}
+              style={{
+                marginLeft: "0.5rem",
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                textDecoration: "underline",
+                color: "inherit",
+                fontSize: "inherit",
+                padding: 0,
+              }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {latestShareableLink && (
           <ShareableLinkDialog
             link={latestShareableLink}
@@ -1189,7 +1334,11 @@ const ExcalidrawWrapper = () => {
           }}
         />
 
-        <AppSidebar />
+        <AppSidebar
+          currentSceneId={ServerPersistence.getCurrentSceneId()}
+          onSceneSelect={handleSceneSelect}
+          onNewBoard={handleNewBoard}
+        />
 
         {errorMessage && (
           <ErrorDialog onClose={() => setErrorMessage("")}>
@@ -1260,6 +1409,27 @@ const ExcalidrawWrapper = () => {
                 setShareDialogState({ isOpen: true, type: "share" });
               },
             },
+            ...(isServerPersistenceEnabled
+              ? [
+                  {
+                    label: "New Board",
+                    category: DEFAULT_CATEGORIES.app,
+                    predicate: true,
+                    icon: PlusIcon,
+                    keywords: [
+                      "new",
+                      "board",
+                      "scene",
+                      "whiteboard",
+                      "create",
+                      "blank",
+                    ],
+                    perform: () => {
+                      handleNewBoard();
+                    },
+                  },
+                ]
+              : []),
             {
               label: "GitHub",
               icon: GithubIcon,

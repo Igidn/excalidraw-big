@@ -1,0 +1,68 @@
+.excalidraw {
+  .server-save-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.75rem;
+    color: var(--color-on-surface);
+    user-select: none;
+
+    svg {
+      width: 0.875rem;
+      height: 0.875rem;
+      flex-shrink: 0;
+    }
+
+    &--saving {
+      color: var(--color-on-surface);
+    }
+
+    &--saved {
+      color: var(--color-success);
+      opacity: 0.7;
+    }
+
+    &--error {
+      color: var(--color-danger);
+      font-weight: 600;
+    }
+
+    &__spinner {
+      display: inline-block;
+      width: 0.75rem;
+      height: 0.75rem;
+      border: 2px solid var(--color-on-surface);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: server-save-spinner 0.6s linear infinite;
+    }
+
+    &__retry {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: none;
+      border: none;
+      padding: 0.15rem;
+      margin: 0;
+      cursor: pointer;
+      color: inherit;
+      border-radius: var(--border-radius-sm);
+
+      &:hover {
+        background-color: var(--color-surface-low);
+      }
+
+      svg {
+        width: 0.875rem;
+        height: 0.875rem;
+      }
+    }
+  }
+}
+
+@keyframes server-save-spinner {
+  to {
+    transform: rotate(360deg);
+  }
+}

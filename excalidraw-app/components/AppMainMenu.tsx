@@ -2,6 +2,7 @@ import {
   loginIcon,
   ExcalLogo,
   eyeIcon,
+  PlusIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { MainMenu } from "@excalidraw/excalidraw/index";
 import React from "react";
@@ -12,6 +13,7 @@ import type { Theme } from "@excalidraw/element/types";
 
 import { LanguageList } from "../app-language/LanguageList";
 import { isExcalidrawPlusSignedUser } from "../app_constants";
+import { isServerPersistenceEnabled } from "../data/ServerPersistence";
 
 import { saveDebugState } from "./DebugCanvas";
 
@@ -22,6 +24,7 @@ export const AppMainMenu: React.FC<{
   theme: Theme | "system";
   setTheme: (theme: Theme | "system") => void;
   refresh: () => void;
+  onNewBoard?: () => void;
 }> = React.memo((props) => {
   return (
     <MainMenu>
@@ -34,6 +37,14 @@ export const AppMainMenu: React.FC<{
           isCollaborating={props.isCollaborating}
           onSelect={() => props.onCollabDialogOpen()}
         />
+      )}
+      {isServerPersistenceEnabled && props.onNewBoard && (
+        <MainMenu.Item
+          icon={PlusIcon}
+          onSelect={() => props.onNewBoard!()}
+        >
+          New Board
+        </MainMenu.Item>
       )}
       <MainMenu.DefaultItems.CommandPalette className="highlighted" />
       <MainMenu.DefaultItems.SearchMenu />
