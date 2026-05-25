@@ -115,7 +115,7 @@ import {
   isCollaborationLink,
 } from "./data";
 
-import { updateStaleImageStatuses } from "./data/FileManager";
+import { FileManager, updateStaleImageStatuses } from "./data/FileManager";
 import { FileStatusStore } from "./data/fileStatusStore";
 import {
   importFromLocalStorage,
@@ -129,7 +129,14 @@ import {
   LocalData,
   localStorageQuotaExceededAtom,
 } from "./data/LocalData";
-import { isBrowserStorageStateNewer } from "./data/tabSync";
+import {
+  isBrowserStorageStateNewer,
+  isLastActiveSceneNewer,
+} from "./data/tabSync";
+import {
+  isServerPersistenceEnabled,
+  ServerPersistence,
+} from "./data/ServerPersistence";
 import { ShareDialog, shareDialogStateAtom } from "./share/ShareDialog";
 import CollabError, { collabErrorIndicatorAtom } from "./collab/CollabError";
 import { useHandleAppTheme } from "./useHandleAppTheme";
@@ -224,6 +231,7 @@ const initializeScene = async (opts: {
 > => {
   const searchParams = new URLSearchParams(window.location.search);
   const id = searchParams.get("id");
+  const sceneIdParam = searchParams.get("scene");
   const jsonBackendMatch = window.location.hash.match(
     /^#json=([a-zA-Z0-9_-]+),([a-zA-Z0-9_-]+)$/,
   );
@@ -248,6 +256,57 @@ const initializeScene = async (opts: {
 
   let roomLinkData = getCollaborationLinkData(window.location.href);
   const isExternalScene = !!(id || jsonBackendMatch || roomLinkData);
+
+  // Server persistence branch
+  if (isServerPersistenceEnabled && !isExternalScene && !externalUrlMatch) {
+    const sceneId = sceneIdParam || ServerPersistence.getLastActiveSceneId();
+
+    if (sceneId) {
+      try {
+        const serverScene = await ServerPersistence.loadScene(sceneId);
+        if (serverScene) {
+          ServerPersistence.setCurrentSceneId(serverScene.id);
+          scene = {
+            elements: restoreElements(serverScene.elements, null, {
+              repairBindings: true,
+              deleteInvisibleElements: true,
+            }),
+            appState: restoreAppState(
+              serverScene.appState,
+              localDataState?.appState,
+            ),
+            scrollToContent: true,
+          };
+          return { scene, isExternalScene: false };
+        }
+      } catch (error) {
+        console.error("Failed to load scene from server:", error);
+      }
+    }
+
+    // Create new empty scene
+    try {
+      const defaultAppState = getDefaultAppState();
+      const newScene = await ServerPersistence.createScene(
+        [],
+        defaultAppState,
+        {},
+      );
+      ServerPersistence.setCurrentSceneId(newScene.id);
+      const url = new URL(window.location.href);
+      url.searchParams.set("scene", newScene.id);
+      window.history.replaceState({}, APP_NAME, url.toString());
+      scene = {
+        elements: [],
+        appState: restoreAppState({}, localDataState?.appState),
+      };
+      return { scene, isExternalScene: false };
+    } catch (error) {
+      console.error("Failed to create new scene on server:", error);
+      // Fall back to localStorage behavior below
+    }
+  }
+
   if (isExternalScene) {
     if (
       // don't prompt if scene is empty
@@ -394,6 +453,17 @@ const ExcalidrawWrapper = () => {
       resolvablePromise<ExcalidrawInitialDataState | null>();
   }
 
+  const fileManagerRef = useRef<FileManager>(
+    isServerPersistenceEnabled
+      ? new FileManager({
+          getFiles: ServerPersistence.fileStorage.getFiles,
+          saveFiles: ServerPersistence.fileStorage.saveFiles,
+          onFileStatusChange:
+            FileStatusStore.updateStatuses.bind(FileStatusStore),
+        })
+      : LocalData.fileStorage,
+  );
+
   const debugCanvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -496,7 +566,7 @@ const ExcalidrawWrapper = () => {
           });
         } else if (isInitialLoad) {
           if (fileIds.length) {
-            LocalData.fileStorage
+            fileManagerRef.current
               .getFiles(fileIds)
               .then(async ({ loadedFiles, erroredFiles }) => {
                 if (loadedFiles.length) {
@@ -510,10 +580,12 @@ const ExcalidrawWrapper = () => {
               });
           }
           // on fresh load, clear unused files from IDB (from previous
-          // session)
-          LocalData.fileStorage.clearObsoleteFiles({
-            currentFileIds: fileIds,
-          });
+          // session) — only when using local storage
+          if (!isServerPersistenceEnabled) {
+            LocalData.fileStorage.clearObsoleteFiles({
+              currentFileIds: fileIds,
+            });
+          }
         }
       }
     },
@@ -565,64 +637,95 @@ const ExcalidrawWrapper = () => {
         !document.hidden &&
         ((collabAPI && !collabAPI.isCollaborating()) || isCollabDisabled)
       ) {
-        // don't sync if local state is newer or identical to browser state
-        if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)) {
-          const localDataState = importFromLocalStorage();
-          const username = importUsernameFromLocalStorage();
-          setLangCode(getPreferredLanguage());
-          excalidrawAPI.updateScene({
-            ...localDataState,
-            captureUpdate: CaptureUpdateAction.NEVER,
-          });
-          LibraryIndexedDBAdapter.load().then((data) => {
-            if (data) {
-              excalidrawAPI.updateLibrary({
-                libraryItems: data.libraryItems,
-              });
-            }
-          });
-          collabAPI?.setUsername(username || "");
-        }
-
-        if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_FILES)) {
-          const elements = excalidrawAPI.getSceneElementsIncludingDeleted();
-          const currFiles = excalidrawAPI.getFiles();
-          const fileIds =
-            elements?.reduce((acc, element) => {
-              if (
-                isInitializedImageElement(element) &&
-                // only load and update images that aren't already loaded
-                !currFiles[element.fileId]
-              ) {
-                return acc.concat(element.fileId);
-              }
-              return acc;
-            }, [] as FileId[]) || [];
-          if (fileIds.length) {
-            LocalData.fileStorage
-              .getFiles(fileIds)
-              .then(({ loadedFiles, erroredFiles }) => {
-                if (loadedFiles.length) {
-                  excalidrawAPI.addFiles(loadedFiles);
-                }
-                updateStaleImageStatuses({
-                  excalidrawAPI,
-                  erroredFiles,
-                  elements: excalidrawAPI.getSceneElementsIncludingDeleted(),
+        if (isServerPersistenceEnabled) {
+          const currentSceneId = ServerPersistence.getCurrentSceneId();
+          if (isLastActiveSceneNewer(currentSceneId)) {
+            const lastSceneId = ServerPersistence.getLastActiveSceneId()!;
+            const url = new URL(window.location.href);
+            url.searchParams.set("scene", lastSceneId);
+            window.history.replaceState({}, APP_NAME, url.toString());
+            excalidrawAPI.updateScene({ appState: { isLoading: true } });
+            initializeScene({ collabAPI, excalidrawAPI }).then((data) => {
+              loadImages(data);
+              if (data.scene) {
+                excalidrawAPI.updateScene({
+                  elements: restoreElements(data.scene.elements, null, {
+                    repairBindings: true,
+                  }),
+                  appState: restoreAppState(data.scene.appState, null),
+                  captureUpdate: CaptureUpdateAction.IMMEDIATELY,
                 });
-              });
+              }
+            });
+          }
+        } else {
+          // don't sync if local state is newer or identical to browser state
+          if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)) {
+            const localDataState = importFromLocalStorage();
+            const username = importUsernameFromLocalStorage();
+            setLangCode(getPreferredLanguage());
+            excalidrawAPI.updateScene({
+              ...localDataState,
+              captureUpdate: CaptureUpdateAction.NEVER,
+            });
+            LibraryIndexedDBAdapter.load().then((data) => {
+              if (data) {
+                excalidrawAPI.updateLibrary({
+                  libraryItems: data.libraryItems,
+                });
+              }
+            });
+            collabAPI?.setUsername(username || "");
+          }
+
+          if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_FILES)) {
+            const elements = excalidrawAPI.getSceneElementsIncludingDeleted();
+            const currFiles = excalidrawAPI.getFiles();
+            const fileIds =
+              elements?.reduce((acc, element) => {
+                if (
+                  isInitializedImageElement(element) &&
+                  // only load and update images that aren't already loaded
+                  !currFiles[element.fileId]
+                ) {
+                  return acc.concat(element.fileId);
+                }
+                return acc;
+              }, [] as FileId[]) || [];
+            if (fileIds.length) {
+              fileManagerRef.current
+                .getFiles(fileIds)
+                .then(({ loadedFiles, erroredFiles }) => {
+                  if (loadedFiles.length) {
+                    excalidrawAPI.addFiles(loadedFiles);
+                  }
+                  updateStaleImageStatuses({
+                    excalidrawAPI,
+                    erroredFiles,
+                    elements: excalidrawAPI.getSceneElementsIncludingDeleted(),
+                  });
+                });
+            }
           }
         }
       }
     }, SYNC_BROWSER_TABS_TIMEOUT);
 
     const onUnload = () => {
-      LocalData.flushSave();
+      if (isServerPersistenceEnabled) {
+        ServerPersistence.flushSave();
+      } else {
+        LocalData.flushSave();
+      }
     };
 
     const visibilityChange = (event: FocusEvent | Event) => {
       if (event.type === EVENT.BLUR || document.hidden) {
-        LocalData.flushSave();
+        if (isServerPersistenceEnabled) {
+          ServerPersistence.flushSave();
+        } else {
+          LocalData.flushSave();
+        }
       }
       if (
         event.type === EVENT.VISIBILITY_CHANGE ||
@@ -652,11 +755,15 @@ const ExcalidrawWrapper = () => {
 
   useEffect(() => {
     const unloadHandler = (event: BeforeUnloadEvent) => {
-      LocalData.flushSave();
+      if (isServerPersistenceEnabled) {
+        ServerPersistence.flushSave();
+      } else {
+        LocalData.flushSave();
+      }
 
       if (
         excalidrawAPI &&
-        LocalData.fileStorage.shouldPreventUnload(
+        fileManagerRef.current.shouldPreventUnload(
           excalidrawAPI.getSceneElements(),
         )
       ) {
@@ -684,36 +791,53 @@ const ExcalidrawWrapper = () => {
       collabAPI.syncElements(elements);
     }
 
+    const updateImageElementStatuses = () => {
+      if (!excalidrawAPI) {
+        return;
+      }
+      let didChange = false;
+
+      const updatedElements = excalidrawAPI
+        .getSceneElementsIncludingDeleted()
+        .map((element) => {
+          if (fileManagerRef.current.shouldUpdateImageElementStatus(element)) {
+            const newElement = newElementWith(element, { status: "saved" });
+            if (newElement !== element) {
+              didChange = true;
+            }
+            return newElement;
+          }
+          return element;
+        });
+
+      if (didChange) {
+        excalidrawAPI.updateScene({
+          elements: updatedElements,
+          captureUpdate: CaptureUpdateAction.NEVER,
+        });
+      }
+    };
+
     // this check is redundant, but since this is a hot path, it's best
     // not to evaludate the nested expression every time
     if (!LocalData.isSavePaused()) {
-      LocalData.save(elements, appState, files, () => {
-        if (excalidrawAPI) {
-          let didChange = false;
-
-          const elements = excalidrawAPI
-            .getSceneElementsIncludingDeleted()
-            .map((element) => {
-              if (
-                LocalData.fileStorage.shouldUpdateImageElementStatus(element)
-              ) {
-                const newElement = newElementWith(element, { status: "saved" });
-                if (newElement !== element) {
-                  didChange = true;
-                }
-                return newElement;
-              }
-              return element;
-            });
-
-          if (didChange) {
-            excalidrawAPI.updateScene({
-              elements,
-              captureUpdate: CaptureUpdateAction.NEVER,
-            });
-          }
-        }
-      });
+      if (isServerPersistenceEnabled) {
+        ServerPersistence.save(elements, appState, files, () => {
+          // Scene saved to server
+        });
+        fileManagerRef.current
+          .saveFiles({ elements, files })
+          .then(() => {
+            updateImageElementStatuses();
+          })
+          .catch((error) => {
+            console.error("File save error:", error);
+          });
+      } else {
+        LocalData.save(elements, appState, files, () => {
+          updateImageElementStatuses();
+        });
+      }
     }
 
     // Render the debug scene if the debug canvas is available

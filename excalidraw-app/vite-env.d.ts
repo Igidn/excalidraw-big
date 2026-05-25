@@ -32,6 +32,9 @@ interface ImportMetaEnv {
   // Enable PWA in dev server
   VITE_APP_ENABLE_PWA: string;
 
+  // Self-hosted backend URL for server-side persistence
+  VITE_APP_BACKEND_URL: string;
+
   VITE_APP_PLUS_LP: string;
 
   VITE_APP_PLUS_APP: string;

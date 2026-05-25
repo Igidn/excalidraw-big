@@ -1,5 +1,7 @@
 import { STORAGE_KEYS } from "../app_constants";
 
+const LAST_ACTIVE_SCENE_KEY = "excalidraw-last-scene";
+
 // in-memory state (this tab's current state) versions. Currently just
 // timestamps of the last time the state was saved to browser storage.
 const LOCAL_STATE_VERSIONS = {
@@ -36,4 +38,18 @@ export const resetBrowserStateVersions = () => {
   } catch (error) {
     console.error("error while resetting browser state verison", error);
   }
+};
+
+// Minimal last-active-scene sync for server persistence
+export const getLastActiveSceneId = (): string | null => {
+  return localStorage.getItem(LAST_ACTIVE_SCENE_KEY);
+};
+
+export const setLastActiveSceneId = (sceneId: string) => {
+  localStorage.setItem(LAST_ACTIVE_SCENE_KEY, sceneId);
+};
+
+export const isLastActiveSceneNewer = (currentSceneId: string | null) => {
+  const lastSceneId = getLastActiveSceneId();
+  return lastSceneId && lastSceneId !== currentSceneId;
 };

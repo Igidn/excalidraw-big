@@ -46,6 +46,8 @@ import { FileStatusStore } from "./fileStatusStore";
 import { Locker } from "./Locker";
 import { updateBrowserStateVersion } from "./tabSync";
 
+const isServerPersistenceEnabled = !!import.meta.env.VITE_APP_BACKEND_URL;
+
 const filesStore = createStore("files-db", "files-store");
 
 export const localStorageQuotaExceededAtom = atom(false);
@@ -122,6 +124,11 @@ export class LocalData {
       files: BinaryFiles,
       onFilesSaved: () => void,
     ) => {
+      if (isServerPersistenceEnabled) {
+        // Server persistence handles all saves; LocalData is bypassed
+        return;
+      }
+
       saveDataStateToLocalStorage(elements, appState);
 
       await this.fileStorage.saveFiles({
