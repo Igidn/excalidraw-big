@@ -39,10 +39,7 @@ export const AppMainMenu: React.FC<{
         />
       )}
       {isServerPersistenceEnabled && props.onNewBoard && (
-        <MainMenu.Item
-          icon={PlusIcon}
-          onSelect={() => props.onNewBoard!()}
-        >
+        <MainMenu.Item icon={PlusIcon} onSelect={() => props.onNewBoard!()}>
           New Board
         </MainMenu.Item>
       )}

@@ -238,7 +238,9 @@ export class ServerPersistence {
   static async loadScene(sceneId: string): Promise<ServerScene | null> {
     const browserId = this.getBrowserId();
     const response = await fetch(
-      `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}?browserId=${encodeURIComponent(browserId)}`,
+      `${BACKEND_URL}/api/scenes/${encodeURIComponent(
+        sceneId,
+      )}?browserId=${encodeURIComponent(browserId)}`,
     );
 
     if (response.status === 404) {
@@ -316,10 +318,16 @@ export class ServerPersistence {
       const loadedFiles: BinaryFileData[] = [];
       const erroredFiles = new Map<FileId, true>();
 
+      const browserId = this.getBrowserId();
+
       await withConcurrencyLimit(ids, 5, async (id) => {
         try {
           const response = await fetch(
-            `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}/files/${encodeURIComponent(id)}`,
+            `${BACKEND_URL}/api/scenes/${encodeURIComponent(
+              sceneId,
+            )}/files/${encodeURIComponent(
+              id,
+            )}?browserId=${encodeURIComponent(browserId)}`,
           );
           if (!response.ok) {
             erroredFiles.set(id, true);
@@ -328,8 +336,7 @@ export class ServerPersistence {
 
           const blob = await response.blob();
           const mimeType =
-            response.headers.get("Content-Type") ||
-            "application/octet-stream";
+            response.headers.get("Content-Type") || "application/octet-stream";
           const dataURL = await blobToDataURL(blob);
 
           loadedFiles.push({
@@ -367,6 +374,8 @@ export class ServerPersistence {
       const savedFiles = new Map<FileId, BinaryFileData>();
       const erroredFiles = new Map<FileId, BinaryFileData>();
 
+      const browserId = this.getBrowserId();
+
       await withConcurrencyLimit([...addedFiles], 5, async ([id, fileData]) => {
         const savePromise = (async () => {
           try {
@@ -377,6 +386,7 @@ export class ServerPersistence {
             formData.append("fileId", id);
             formData.append("mimeType", fileData.mimeType);
             formData.append("created", String(fileData.created));
+            formData.append("browserId", browserId);
 
             const response = await fetch(
               `${BACKEND_URL}/api/scenes/${encodeURIComponent(sceneId)}/files`,
@@ -408,7 +418,7 @@ export class ServerPersistence {
   };
 }
 
-const withConcurrencyLimit = async <T,>(
+const withConcurrencyLimit = async <T>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<void>,

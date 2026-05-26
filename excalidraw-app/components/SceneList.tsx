@@ -1,10 +1,6 @@
-import { useAtomValue } from "jotai";
 import React, { useCallback, useEffect, useState } from "react";
 
-import {
-  PlusIcon,
-  TrashIcon,
-} from "@excalidraw/excalidraw/components/icons";
+import { PlusIcon, TrashIcon } from "@excalidraw/excalidraw/components/icons";
 
 import {
   isServerPersistenceEnabled,
@@ -124,7 +120,9 @@ export const SceneList: React.FC<{
         {scenes.map((scene) => (
           <li
             key={scene.id}
-            className={`scene-list__item ${scene.id === currentSceneId ? "scene-list__item--active" : ""} ${deletingId === scene.id ? "scene-list__item--deleting" : ""}`}
+            className={`scene-list__item ${
+              scene.id === currentSceneId ? "scene-list__item--active" : ""
+            } ${deletingId === scene.id ? "scene-list__item--deleting" : ""}`}
             onClick={() => onSceneSelect(scene.id)}
           >
             <div className="scene-list__item-info">

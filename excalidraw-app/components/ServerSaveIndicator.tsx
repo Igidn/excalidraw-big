@@ -1,4 +1,3 @@
-import { useAtomValue } from "jotai";
 import React from "react";
 
 import {
@@ -6,6 +5,8 @@ import {
   checkIcon,
   RetryIcon,
 } from "@excalidraw/excalidraw/components/icons";
+
+import { useAtomValue } from "../app-jotai";
 
 import {
   serverSaveErrorAtom,

@@ -261,7 +261,7 @@ const initializeScene = async (opts: {
   // Server persistence branch
   if (isServerPersistenceEnabled && !isExternalScene && !externalUrlMatch) {
     const sceneId = sceneIdParam || ServerPersistence.getLastActiveSceneId();
-    let shouldCreateNewScene = !sceneId;
+    const shouldCreateNewScene = !sceneId;
 
     if (sceneId) {
       try {
@@ -938,6 +938,7 @@ const ExcalidrawWrapper = () => {
   const localStorageQuotaExceeded = useAtomValue(localStorageQuotaExceededAtom);
 
   const [serverLoadError, setServerLoadError] = useState<string | null>(null);
+  const isSwitchingSceneRef = useRef(false);
 
   const handleSceneSelect = useCallback(
     async (sceneId: string) => {
@@ -947,6 +948,11 @@ const ExcalidrawWrapper = () => {
       if (sceneId === ServerPersistence.getCurrentSceneId()) {
         return;
       }
+      if (isSwitchingSceneRef.current) {
+        return;
+      }
+
+      isSwitchingSceneRef.current = true;
 
       ServerPersistence.flushSave();
       await ServerPersistence.flushFileSaves().catch(() => {});
@@ -965,15 +971,17 @@ const ExcalidrawWrapper = () => {
         url.searchParams.set("scene", serverScene.id);
         window.history.replaceState({}, APP_NAME, url.toString());
 
+        const restoredAppState = restoreAppState(
+          serverScene.appState,
+          excalidrawAPI.getAppState(),
+        );
+
         excalidrawAPI.updateScene({
           elements: restoreElements(serverScene.elements, null, {
             repairBindings: true,
             deleteInvisibleElements: true,
           }),
-          appState: restoreAppState(
-            serverScene.appState,
-            excalidrawAPI.getAppState(),
-          ),
+          appState: { ...restoredAppState, isLoading: false },
           captureUpdate: CaptureUpdateAction.IMMEDIATELY,
         });
 
@@ -1002,9 +1010,12 @@ const ExcalidrawWrapper = () => {
       } catch (error: any) {
         console.error("Failed to switch scene:", error);
         setServerLoadError(
-          error.message || "Unable to connect to the whiteboard server. Please check your connection.",
+          error.message ||
+            "Unable to connect to the whiteboard server. Please check your connection.",
         );
         excalidrawAPI.updateScene({ appState: { isLoading: false } });
+      } finally {
+        isSwitchingSceneRef.current = false;
       }
     },
     [excalidrawAPI],
@@ -1039,7 +1050,8 @@ const ExcalidrawWrapper = () => {
     } catch (error: any) {
       console.error("Failed to create new scene:", error);
       setServerLoadError(
-        error.message || "Unable to connect to the whiteboard server. Please check your connection.",
+        error.message ||
+          "Unable to connect to the whiteboard server. Please check your connection.",
       );
     }
   }, [excalidrawAPI]);
